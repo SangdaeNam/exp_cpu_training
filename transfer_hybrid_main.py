@@ -9,7 +9,7 @@ from openvino.runtime import Core
 import os
 import sys
 
-def train_valid(_device, _model, _dataset, _freezing=1, _valid_size=0.2, _epoch=5):
+def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2, _epoch=5):
     print("Exp: ", _device, _model, _dataset, _valid_size, _epoch)
 
     if _device == 'ipex':
@@ -121,7 +121,7 @@ def train_valid(_device, _model, _dataset, _freezing=1, _valid_size=0.2, _epoch=
     
     # onnx convert
     onnx_path = Path("mbv2_cifar10_16.onnx")
-    if not onnx_path.exists():
+    if not onnx_path.exists() or _update==True:
         torch.onnx.export(frozen_net, x, onnx_path, export_params=True,do_constant_folding=False,
                         opset_version=11,input_names=['input'], output_names=['output'],)  
         print(f"ONNX model exported to {onnx_path}.")      
@@ -129,7 +129,7 @@ def train_valid(_device, _model, _dataset, _freezing=1, _valid_size=0.2, _epoch=
         print(f"ONNX model {onnx_path} already exists.")       
     
     ir_path = Path("mbv2_cifar10_16.xml")
-    if not ir_path.exists():
+    if not ir_path.exists() or _update==True:
         mo_command = f"""mo
                  --input_model "{onnx_path}"
                  --input_shape "[128,3, 224, 224]"
@@ -145,6 +145,8 @@ def train_valid(_device, _model, _dataset, _freezing=1, _valid_size=0.2, _epoch=
     ie = Core()
     model_ir = ie.read_model(model=ir_path)
     compiled_model_ir = ie.compile_model(model=model_ir, device_name="CPU")
+    request_ir = compiled_model_ir.create_infer_request()
+    input_layer_ir = next(iter(compiled_model_ir.inputs))
     output_layer_ir = next(iter(compiled_model_ir.outputs))
 
     #setting dataloader
@@ -195,7 +197,7 @@ def train_valid(_device, _model, _dataset, _freezing=1, _valid_size=0.2, _epoch=
             target = target.to(device=device)
 
             optimizer.zero_grad()
-            res_ir = torch.from_numpy(compiled_model_ir(inputs=[data])[output_layer_ir]).to(device) #openvino inference
+            res_ir = torch.from_numpy(np.squeeze(np.array(list(request_ir.infer(inputs=[data]).values())))).to(device)
             output = model(res_ir) #liner layer training
             loss = criterion(output, target)
             loss.backward()
@@ -209,7 +211,7 @@ def train_valid(_device, _model, _dataset, _freezing=1, _valid_size=0.2, _epoch=
                 # valid_data = valid_data.to(device=device, memory_format=torch.channels_last)
                 valid_data = valid_data.to(device=device)
                 valid_target = valid_target.to(device=device)
-                res_ir = torch.from_numpy(compiled_model_ir(inputs=[data])[output_layer_ir]).to(device) #openvino inference
+                res_ir = torch.from_numpy(np.squeeze(np.array(list(request_ir.infer(inputs=[valid_data]).values())))).to(device)
                 valid_output = model(res_ir)
 
                 _, valid_preds = torch.max(valid_output, 1)
@@ -230,7 +232,7 @@ epochs = 2
 
 torch.cuda.empty_cache()
 start_time = time.time()
-result = train_valid(device,model,dataset,_freezing=freeze_num,_epoch=epochs)
+result = train_valid(device,model,dataset,_update=True,_freezing=freeze_num,_epoch=epochs)
 end_time = time.time()
 torch.cuda.empty_cache()
 print(result)
