@@ -10,11 +10,12 @@ import os
 import sys
 
 def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2, _epoch=5):
+    assert _device in ['ipex', 'cpu', 'gpu', 'igpu']
     print("Exp: ", _device, _model, _dataset, _valid_size, _epoch)
 
+    #------------------Setting Device----------------------
     if _device == 'ipex':
         import intel_extension_for_pytorch as ipex
-        #ipex.enable_onednn_fusion(True)  #oneDNN graph fusion is enabled by default in ipex
         device = torch.device('cpu')
     elif _device == 'gpu':
         print(torch.cuda.is_available())
@@ -22,7 +23,7 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     else:
         device = torch.device('cpu')
 
-    LR = 0.001
+    #------------------Setting Dataset----------------------
     DOWNLOAD = True
     transform = torchvision.transforms.Compose([
         torchvision.transforms.Resize((224, 224)),
@@ -33,14 +34,7 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     if _dataset == 'cifar10':
         DATA = 'datasets/cifar10/'
 
-        train_dataset = torchvision.datasets.CIFAR10(
-                root=DATA,
-                train=True,
-                transform=transform,
-                download=DOWNLOAD,
-        )
-
-        valid_dataset = torchvision.datasets.CIFAR10(
+        dataset = torchvision.datasets.CIFAR10(
                 root=DATA,
                 train=True,
                 transform=transform,
@@ -50,19 +44,14 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     elif _dataset == 'svhn':
         DATA = 'datasets/SVHN/'
 
-        train_dataset = torchvision.datasets.SVHN(
-                root=DATA,
-                split='train',
-                transform=transform,
-                download=DOWNLOAD,
-        )
-        valid_dataset = torchvision.datasets.SVHN(
+        dataset = torchvision.datasets.SVHN(
                 root=DATA,
                 split='train',
                 transform=transform,
                 download=DOWNLOAD,
         )
     
+    #------------------Setting Model----------------------
     if _model == 'res_18':
         model = torchvision.models.resnet18(pretrained=True)
     elif _model == 'res_50':
@@ -74,25 +63,22 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     elif _model == 'shuffle_v2':
         model = torchvision.models.shufflenet_v2_x1_0(pretrained=True)
 
-    # model freezing
+    #------------------Model Freezing----------------------
     if _freezing == 0:
         pass
     else:
         try: #resnet50 case
-            layers = []
-            ct = 0
-            child_len = len(list(model.children()))
+            model_list = list(model.children())
+            model_list.insert(-1, nn.Flatten(1))
+            child_len = len(model_list)
             freeze_num = child_len - _freezing
-            for child in model.children():
-                ct += 1
-                if ct <= freeze_num:
-                    for param in child.parameters():
-                        param.requires_grad = False
-                    layers.append(child)
-            layers.append(nn.Flatten(1))
-            frozen_net = nn.Sequential(*layers)
-            num_ftrs = model.fc.in_features
-            model = nn.Linear(num_ftrs, 10)
+            feature_channel = model.fc.in_features
+            model.fc = nn.Linear(feature_channel, 10)
+            frozen_net = torch.nn.Sequential(*model_list[:freeze_num])
+            for child in frozen_net.children():
+                for param in child.parameters():
+                    param.requires_grad = False
+            model = torch.nn.Sequential(*model_list[freeze_num:])
 
         except: #mobv2 case
             layers = []
@@ -113,14 +99,15 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
             num_ftrs = model.classifier[-1].in_features
             model.classifier[-1] = nn.Linear(num_ftrs, 10)
             model = model.classifier   
-    
     frozen_net.eval()
+    
+    #------------------Openvino IR----------------------
     # make dummy data
     batch_size = 128
-    x = torch.rand(batch_size, 3, 224, 224, requires_grad=False).to(device)
+    x = torch.rand(batch_size, 3, 224, 224, requires_grad=False)
     
     # onnx convert
-    onnx_path = Path("mbv2_cifar10_16.onnx")
+    onnx_path = Path("resnet50_cifar10_16.onnx")
     if not onnx_path.exists() or _update==True:
         torch.onnx.export(frozen_net, x, onnx_path, export_params=True,do_constant_folding=False,
                         opset_version=11,input_names=['input'], output_names=['output'],)  
@@ -128,7 +115,7 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     else:
         print(f"ONNX model {onnx_path} already exists.")       
     
-    ir_path = Path("mbv2_cifar10_16.xml")
+    ir_path = Path("resnet50_cifar10_16.xml")
     if not ir_path.exists() or _update==True:
         mo_command = f"""mo
                  --input_model "{onnx_path}"
@@ -144,13 +131,14 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     
     ie = Core()
     model_ir = ie.read_model(model=ir_path)
-    compiled_model_ir = ie.compile_model(model=model_ir, device_name="CPU")
+    if _device == 'igpu':
+        compiled_model_ir = ie.compile_model(model=model_ir, device_name="GPU")
+    else:
+        compiled_model_ir = ie.compile_model(model=model_ir, device_name="CPU")
     request_ir = compiled_model_ir.create_infer_request()
-    input_layer_ir = next(iter(compiled_model_ir.inputs))
-    output_layer_ir = next(iter(compiled_model_ir.outputs))
 
-    #setting dataloader
-    num_train = len(train_dataset)
+    #------------------Setting DataLoader----------------------
+    num_train = len(dataset)
     indices = list(range(num_train))
     split = int(np.floor(_valid_size * num_train))
 
@@ -163,20 +151,22 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     valid_sampler = SubsetRandomSampler(valid_idx)
     
     train_loader = torch.utils.data.DataLoader(
-            dataset=train_dataset,
+            dataset=dataset,
             sampler=train_sampler,
             batch_size=128,
             drop_last=True
     )
     valid_loader = torch.utils.data.DataLoader(
-            dataset=valid_dataset,
+            dataset=dataset,
             sampler=valid_sampler,
             batch_size=128,
             drop_last=True
     )
-
+    
+    #------------------Setting Model hyperparameter----------------------
+    lr = 0.001
     criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr = LR, momentum=0.9)
+    optimizer = torch.optim.SGD(model.parameters(), lr = lr, momentum=0.9)
 
     model.to(device)
     model.train()
@@ -184,7 +174,7 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
     if _device == 'ipex':
         model, optimizer = ipex.optimize(model, optimizer=optimizer)
 
-    #train and valid
+    #------------------Start Training----------------------
     valid_correct_history = []
     for epoch in range(_epoch):
         valid_correct = 0
@@ -192,9 +182,8 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
 
         model.train()
         for batch_idx, (data, target) in enumerate(train_loader):
-            # data = data.to(device=device, memory_format=torch.channels_last)
-            data = data.to(device=device)
-            target = target.to(device=device)
+            data = data.to(device)
+            target = target.to(device)
 
             optimizer.zero_grad()
             res_ir = torch.from_numpy(np.squeeze(np.array(list(request_ir.infer(inputs=[data]).values())))).to(device)
@@ -208,9 +197,8 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
         model.eval()
         with torch.no_grad():
             for valid_batch_idx, (valid_data, valid_target) in enumerate(valid_loader):
-                # valid_data = valid_data.to(device=device, memory_format=torch.channels_last)
-                valid_data = valid_data.to(device=device)
-                valid_target = valid_target.to(device=device)
+                valid_data = valid_data.to(device)
+                valid_target = valid_target.to(device)
                 res_ir = torch.from_numpy(np.squeeze(np.array(list(request_ir.infer(inputs=[valid_data]).values())))).to(device)
                 valid_output = model(res_ir)
 
@@ -224,16 +212,18 @@ def train_valid(_device, _model, _dataset, _update, _freezing=1, _valid_size=0.2
 
     return valid_correct_history
 
-device = 'cpu'
-model = 'mob_v2'
-dataset = 'cifar10'
-freeze_num = 1
-epochs = 2
+if __name__ == "__main__":
+    device = 'igpu' #[cpu, gpu, ipex, igpu]
+    model = 'res_50' #[res_50, mob_v2]
+    dataset = 'cifar10' #[cifar10, SVHN]
+    freeze_num = 9 #1~10
+    update = True # if True remake openvino ir model, if False reuse prebuilt openvino model
+    epochs = 50 
 
-torch.cuda.empty_cache()
-start_time = time.time()
-result = train_valid(device,model,dataset,_update=True,_freezing=freeze_num,_epoch=epochs)
-end_time = time.time()
-torch.cuda.empty_cache()
-print(result)
-print(end_time - start_time)
+    torch.cuda.empty_cache()
+    start_time = time.time()
+    result = train_valid(device,model,dataset,_update=update,_freezing=freeze_num,_epoch=epochs)
+    end_time = time.time()
+    torch.cuda.empty_cache()
+    print(result)
+    print(end_time - start_time)
